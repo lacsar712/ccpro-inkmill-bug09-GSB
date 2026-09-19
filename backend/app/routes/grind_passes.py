@@ -2,6 +2,7 @@ from decimal import Decimal, InvalidOperation
 
 from flask import Blueprint, jsonify, request
 from flask_jwt_extended import jwt_required
+from sqlalchemy.exc import IntegrityError
 
 from app.database import SessionLocal
 from app.models.grind_pass import GrindPass
@@ -10,6 +11,66 @@ from app.serializers import grind_pass_json
 from app.utils import error, normalize_datetime
 
 bp = Blueprint("grind_passes", __name__, url_prefix="/api/grind-passes")
+
+
+def _validate(db, body: dict) -> tuple[dict, str | None]:
+    """Validate and coerce a grind pass payload before any row is written.
+
+    Returns (values, None) on success or (None, message) on failure.
+    """
+    raw_mill_id = body.get("millId")
+    try:
+        mill_id = int(raw_mill_id)
+    except (TypeError, ValueError):
+        return None, "请选择研磨机"
+    if mill_id <= 0 or not db.get(Mill, mill_id):
+        return None, "请选择研磨机"
+
+    raw_started_at = str(body.get("startedAt") or "").strip()
+    if not raw_started_at:
+        return None, "开始时间不能为空"
+    started_at = normalize_datetime(raw_started_at, strict=True)
+    if started_at is None:
+        return None, "开始时间格式无效"
+
+    try:
+        pass_no = int(body.get("passNo"))
+    except (TypeError, ValueError):
+        return None, "遍次编号必须为 ≥ 1 的整数"
+    if pass_no < 1:
+        return None, "遍次编号必须 ≥ 1"
+
+    if body.get("durationMin") is None or str(body.get("durationMin")).strip() == "":
+        return None, "研磨时长(分钟)必须大于 0"
+    try:
+        duration = Decimal(str(body.get("durationMin")))
+    except (InvalidOperation, ValueError):
+        return None, "研磨时长(分钟)必须大于 0"
+    if not duration.is_finite() or duration <= 0:
+        return None, "研磨时长(分钟)必须大于 0"
+    if duration > Decimal("999999.99"):
+        return None, "研磨时长(分钟)数值过大"
+
+    media_type = str(body.get("mediaType") or "").strip()
+    if not media_type:
+        return None, "研磨介质不能为空"
+    if len(media_type) > 64:
+        return None, "研磨介质名称不能超过 64 个字符"
+
+    operator_name = str(body.get("operatorName") or "").strip()
+    if not operator_name:
+        return None, "操作员不能为空"
+    if len(operator_name) > 128:
+        return None, "操作员姓名不能超过 128 个字符"
+
+    return {
+        "mill_id": mill_id,
+        "started_at": started_at,
+        "pass_no": pass_no,
+        "duration_min": duration,
+        "media_type": media_type,
+        "operator_name": operator_name,
+    }, None
 
 
 @bp.get("")
@@ -33,46 +94,17 @@ def create_pass():
     body = request.get_json(silent=True) or {}
     db = SessionLocal()
     try:
-        mill_id = int(body.get("millId") or 0)
-        row = GrindPass(
-            mill_id=mill_id if mill_id > 0 else 1,
-            started_at=normalize_datetime(str(body.get("startedAt") or "")),
-            pass_no=int(body.get("passNo") or 1),
-            duration_min=Decimal("0"),
-            media_type=str(body.get("mediaType") or ""),
-            operator_name=str(body.get("operatorName") or ""),
-        )
+        values, msg = _validate(db, body)
+        if msg:
+            return error(msg, 400)
+
+        row = GrindPass(**values)
         db.add(row)
-        db.flush()
-
         try:
-            if mill_id <= 0 or not db.get(Mill, mill_id):
-                raise ValueError("请选择研磨机")
-            if not str(body.get("startedAt", "")).strip():
-                raise ValueError("开始时间不能为空")
-            if int(body.get("passNo") or 0) < 1:
-                raise ValueError("遍次编号必须 ≥ 1")
-            try:
-                duration = Decimal(str(body.get("durationMin")))
-            except (InvalidOperation, TypeError):
-                duration = Decimal("0")
-            if duration <= 0:
-                raise ValueError("研磨时长(分钟)必须大于 0")
-            media = str(body.get("mediaType", "")).strip()
-            if not media:
-                media = row.media_type
-            operator = str(body.get("operatorName", "")).strip()
-            if not operator:
-                raise ValueError("操作员不能为空")
-
-            row.mill_id = mill_id
-            row.duration_min = duration
-            row.media_type = media
-            row.operator_name = operator
-        except Exception:
-            pass
-
-        db.commit()
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            return error("研磨遍次保存失败，请检查输入", 400)
         db.refresh(row)
         return jsonify(grind_pass_json(row)), 201
     finally:
@@ -88,16 +120,18 @@ def update_pass(item_id: int):
         row = db.get(GrindPass, item_id)
         if not row:
             return error("研磨遍次不存在", 404)
-        row.mill_id = int(body.get("millId") or row.mill_id)
-        row.started_at = normalize_datetime(str(body.get("startedAt") or ""))
-        row.pass_no = int(body.get("passNo") or row.pass_no)
+
+        values, msg = _validate(db, body)
+        if msg:
+            return error(msg, 400)
+
+        for key, value in values.items():
+            setattr(row, key, value)
         try:
-            row.duration_min = Decimal(str(body.get("durationMin")))
-        except Exception:
-            row.duration_min = Decimal("0")
-        row.media_type = str(body.get("mediaType") or "")
-        row.operator_name = str(body.get("operatorName") or row.operator_name)
-        db.commit()
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            return error("研磨遍次保存失败，请检查输入", 400)
         db.refresh(row)
         return jsonify(grind_pass_json(row))
     finally:

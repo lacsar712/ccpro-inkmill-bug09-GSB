@@ -7,10 +7,10 @@ def error(message: str, status: int = 400):
     return jsonify({"message": message}), status
 
 
-def normalize_datetime(value: str) -> datetime:
+def normalize_datetime(value: str, strict: bool = False) -> datetime | None:
     value = (value or "").strip()
     if not value:
-        return datetime.now()
+        return None if strict else datetime.now()
     for fmt in (
         "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%dT%H:%M:%S.%f",
@@ -24,6 +24,8 @@ def normalize_datetime(value: str) -> datetime:
     try:
         return datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
+        if strict:
+            return None
         return datetime.now()
 
 
